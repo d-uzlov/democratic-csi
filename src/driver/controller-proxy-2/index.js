@@ -5,12 +5,16 @@ const yaml = require("js-yaml");
 const fs = require('fs');
 const { Registry } = require("../../utils/registry");
 
+// ===========================================
+//    Compatibility
+// ===========================================
+//
 // Some drivers will not work properly
 // zfs-local-ephemeral-inline is not supported
 // - NodePublishVolume needs this.options
 // - - Possible fix: Add whole config to node publish secret
 // - NodeUnpublishVolume does not have context to get driver
-// - - Possible fix: ???
+// - - Possible fix: add driver to volume_id
 // zfs-local-* is not supported
 // - NodeGetInfo does not have context to get driver
 // - - Possible fix: move NodeGetInfo into CsiBaseDriver
@@ -19,8 +23,12 @@ const { Registry } = require("../../utils/registry");
 // - - Possible fix: move NodeGetInfo into CsiBaseDriver
 // objectivefs is not supported
 // - NodeStageVolume needs this.options in getDefaultObjectiveFSInstance, used only in NodeStageVolume
-// - - Possible fix: store objectivefs pool data in volume attributes
 // - - Possible fix: Add whole config to node stage secret
+// - - Possible fix: add public pool data into volume attributes, possibly add private data into a secret
+
+// ===========================================
+//    Features
+// ===========================================
 //
 // There are some missing features:
 // - GetCapacity is not possible, there is no concept of unified storage for proxy
@@ -28,32 +36,40 @@ const { Registry } = require("../../utils/registry");
 // - ControllerGetVolume is not possible without k8s access for more context
 // - ListSnapshots is not possible, there is no concept of unified storage for proxy
 // - - Possible to fix for requests with source_volume_id or snapshot_id
+// - - Possible fix: add snapshot secret with connection name into storage class
+
+// ===========================================
+//    Volume cloning and snapshots
+// ===========================================
 //
-// Volume cloning and snapshots:
-// volume_content_source field doesn't have anything except volume_id / snapshot_id
-// Cloning works when both volumes use the same connection.
+// Cloning works without any adjustments when both volumes use the same connection.
 // If the connection is different:
-// - Same driver, same server
+// - TODO: Same driver, same server
 // - - Just need to get proper source location in the CreateVolume
-// - Same driver, different servers
+// - TODO: Same driver, different servers
 // - - It's up to driver to add support
 // - - Example: zfs send-receive
 // - - Example: file copy between nfs servers
-// - Different drivers: block <-> file: will never be possible
+// - Different drivers: block <-> file: unlikely to be practical, if even possible
 // - Different drivers: same filesystem type
 // - - Drivers should implement generic export and import functions
 // - - For example: truenas -> generic-zfs should theoretically be possible via zfs send
 // - - For example: nfs -> nfs should theoretically be possible via file copy
 // - - How to coordinate different drivers?
-//
+
 // TODO support VOLUME_MOUNT_GROUP for SMB?
+// TODO support mapping from generic node_id to proper iqn/nqn in case volume publish is needed
+//      we could replace data in call just like we do with volume_id
 
 // volume_id format:   v2:server-entry/original-handle
 // snapshot_id format: v2:server-entry/original-handle
 // 'v2' - fixed prefix
-// server-entry - name of the config file, without .yaml suffix
-// volume-handle - original handle as expected by the real driver, valid only in context of this server-entry
-//
+// server-entry - connection name
+//                corresponds to `{this.options.proxy.configFolder}/{connectionName}.yaml`
+// original-handle - handle created by the real driver
+
+// a great discussion of difficulties with proxy driver can be found here:
+// https://github.com/container-storage-interface/spec/issues/370
 class CsiProxy2Driver extends CsiBaseDriver {
   constructor(ctx, options) {
     super(...arguments);
@@ -161,20 +177,33 @@ class CsiProxy2Driver extends CsiBaseDriver {
     return 'v2:' + connectionName + '/' + handle;
   }
 
+  // returns real driver object
   lookUpConnection(connectionName) {
     const configFolder = this.options.proxy.configFolder;
     const configPath = configFolder + '/' + connectionName + '.yaml';
 
-    const cachedDriver = this.ctx.registry.get(`controller:driver/connection=${connectionName}`, () => {
-      return {
-        connectionName: connectionName,
-        fileTime: this.getFileTime(configPath),
-        driver: this.createDriverFromFile(configPath),
-      };
-    });
+    const driverPlaceholder = {
+      connectionName: connectionName,
+      fileTime: 0,
+      driver: null,
+    };
+    const cachedDriver = this.ctx.registry.get(`controller:driver/connection=${connectionName}`, driverPlaceholder);
+    if (cachedDriver.timer !== null) {
+      clearTimeout(cachedDriver.timer);
+      cachedDriver.timer = null;
+    }
+    // 1 hour timeout
+    const oneHourInMs = 1000 * 60 * 60;
+    cachedDriver.timer = setTimeout(() => {
+      this.ctx.logger.info("removing inactive connection: %v", connectionName);
+      this.ctx.registry.delete(`controller:driver/connection=${connectionName}`);
+      cachedDriver.timer = null;
+    }, oneHourInMs);
+
     const fileTime = this.getFileTime(configPath);
     if (cachedDriver.fileTime != fileTime) {
-      cachedDriver.fileTime = cachedDriver.fileTime;
+      cachedDriver.fileTime = fileTime;
+      this.ctx.logger.info("creating a new connection: %v", connectionName);
       cachedDriver.driver = this.createDriverFromFile(configPath);
     }
     return cachedDriver.driver;
@@ -208,7 +237,7 @@ class CsiProxy2Driver extends CsiBaseDriver {
     }
   }
 
-  validateDriver(driver) {
+  validateDriverType(driver) {
     const unsupportedDrivers = [
       "zfs-local-",
       "local-hostpath",
@@ -223,7 +252,7 @@ class CsiProxy2Driver extends CsiBaseDriver {
   }
 
   createRealDriver(options) {
-    this.validateDriver(options.driver);
+    this.validateDriverType(options.driver);
     const realContext = Object.assign({}, this.ctx);
     realContext.registry = new Registry();
     const realDriver = this.ctx.factory(realContext, options);
@@ -234,36 +263,41 @@ class CsiProxy2Driver extends CsiBaseDriver {
     return realDriver;
   }
 
+  // ===========================================
+  //    Controller methods below
+  // ===========================================
+
   async CreateVolume(call) {
     const parameters = call.request.parameters;
     if (!parameters.connection) {
       throw 'connection missing from parameters';
     }
     const connectionName = parameters.connection;
-
-    if (call.request.volume_content_source) {
-      switch (call.request.volume_content_source.type) {
-        case "snapshot": {
-          const snapshotHandle = this.parseVolumeHandle(call.request.volume_content_source.snapshot.snapshot_id);
-          if (snapshotHandle.connectionName != connectionName) {
-            throw "could not inflate snapshot from a different connection";
-          }
-          call.request.volume_content_source.snapshot.snapshot_id = snapshotHandle.realHandle;
-          break;
-        }
-        case "volume": {
-          const volumeHandle = this.parseVolumeHandle(call.request.volume_content_source.volume.volume_id);
-          if (volumeHandle.connectionName != connectionName) {
-            throw "could not copy volume from a different connection";
-          }
-          call.request.volume_content_source.volume.volume_id = volumeHandle.realHandle;
-          break;
-        }
-        default:
-          throw 'unknown volume_content_source type: ' + call.request.volume_content_source.type;
-      }
-    }
     const driver = this.lookUpConnection(connectionName);
+
+    switch (call.request.volume_content_source?.type) {
+      case "snapshot": {
+        const snapshotHandle = this.parseVolumeHandle(call.request.volume_content_source.snapshot.snapshot_id);
+        if (snapshotHandle.connectionName != connectionName) {
+          throw "could not inflate snapshot from a different connection";
+        }
+        call.request.volume_content_source.snapshot.snapshot_id = snapshotHandle.realHandle;
+        break;
+      }
+      case "volume": {
+        const volumeHandle = this.parseVolumeHandle(call.request.volume_content_source.volume.volume_id);
+        if (volumeHandle.connectionName != connectionName) {
+          throw "could not clone volume from a different connection";
+        }
+        call.request.volume_content_source.volume.volume_id = volumeHandle.realHandle;
+        break;
+      }
+      case undefined:
+      case null:
+        break;
+      default:
+        throw 'unknown volume_content_source type: ' + call.request.volume_content_source.type;
+    }
     const result = await driver.CreateVolume(call);
     this.ctx.logger.debug("CreateVolume result " + result);
     result.volume.volume_id = this.decorateVolumeHandle(connectionName, result.volume.volume_id);
@@ -289,7 +323,7 @@ class CsiProxy2Driver extends CsiBaseDriver {
     const driver = this.lookUpConnection(volumeHandle.connectionName);
     call.request.source_volume_id = volumeHandle.realHandle;
     const result = await driver.CreateSnapshot(call);
-    result.snapshot.source_volume_id = volumeHandle;
+    result.snapshot.source_volume_id = this.decorateVolumeHandle(connectionName, result.snapshot.source_volume_id);
     result.snapshot.snapshot_id = this.decorateVolumeHandle(connectionName, result.snapshot.snapshot_id);
     return result;
   }
@@ -308,6 +342,23 @@ class CsiProxy2Driver extends CsiBaseDriver {
     return driver.ValidateVolumeCapabilities(call);
   }
 
+  // ===========================================
+  //    Node methods below
+  // ===========================================
+  //
+  // Theoretically, controller setup with config files could be replicated in node deployment,
+  // and node could create proper drivers for each call.
+  // But it doesn't seem like node would benefit from this.
+  // - CsiBaseDriver.NodeStageVolume calls this.assertCapabilities which should be run in the real driver
+  //   but no driver-specific functions or options are used.
+  //   So we can just create an empty driver with default options
+  // - Other Node* methods don't use anything driver specific
+  //
+  // There are a few exceptions:
+  // - zfs-local-ephemeral-inline: could be fixed with local config, but I see this as a low priority task
+  // - zfs-local-*: doesn't depend on config
+  // - local-hostpath: doesn't depend on config
+  // - objectivefs: could be fixed with local config or without it
   lookUpNodeDriver(call) {
     const driverName = call.request.volume_context.provisioner_driver;
     return this.ctx.registry.get(`node:driver/${driverName}`, () => {
@@ -317,16 +368,9 @@ class CsiProxy2Driver extends CsiBaseDriver {
     });
   }
 
-  // CsiBaseDriver.NodeStageVolume calls this.assertCapabilities which should be run in the real driver
-  // but no other driver-specific functions are used,
-  // so we can just create an empty driver with default options
   async NodeStageVolume(call) {
     return this.lookUpNodeDriver(call).NodeStageVolume(call);
   }
-
-  // async NodePublishVolume(call) {
-  //   return this.lookUpNodeDriver(call).NodePublishVolume(call);
-  // }
 }
 
 module.exports.CsiProxy2Driver = CsiProxy2Driver;
