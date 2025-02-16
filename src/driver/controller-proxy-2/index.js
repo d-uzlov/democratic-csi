@@ -4,10 +4,20 @@ const { CsiBaseDriver } = require("../index");
 const yaml = require("js-yaml");
 const fs = require('fs');
 const { Registry } = require("../../utils/registry");
+const { GrpcError, grpc } = require("../../utils/grpc");
 
 // ===========================================
 //    Compatibility
 // ===========================================
+//
+// PUBLISH_UNPUBLISH_VOLUME capability is not supported
+// It would require coordination with NodeGetInfo to get proper node_id value.
+// Currently no driver in the repo implements ControllerPublishVolume
+// so support for publishing is a low priority task.
+//
+// If some methods are missing from underlying driver,
+// proxy will throw UNIMPLEMENTED error.
+// If this is not desired, some methods could return default value instead.
 //
 // Some drivers will not work properly
 // zfs-local-ephemeral-inline is not supported
@@ -33,10 +43,8 @@ const { Registry } = require("../../utils/registry");
 // There are some missing features:
 // - GetCapacity is not possible, there is no concept of unified storage for proxy
 // - ListVolumes is not possible, there is no concept of unified storage for proxy
-// - ControllerGetVolume is not possible without k8s access for more context
-// - ListSnapshots is not possible, there is no concept of unified storage for proxy
-// - - Possible to fix for requests with source_volume_id or snapshot_id
-// - - Possible fix: add snapshot secret with connection name into storage class
+// - ListSnapshots is not implemented
+// - - TODO add snapshot secret with connection name into storage class
 
 // ===========================================
 //    Volume cloning and snapshots
@@ -53,13 +61,19 @@ const { Registry } = require("../../utils/registry");
 // - Different drivers: block <-> file: unlikely to be practical, if even possible
 // - Different drivers: same filesystem type
 // - - Drivers should implement generic export and import functions
-// - - For example: truenas -> generic-zfs should theoretically be possible via zfs send
-// - - For example: nfs -> nfs should theoretically be possible via file copy
+// - - For example: TrueNas -> generic-zfs can theoretically be possible via zfs send
+// - - For example: nfs -> nfs can theoretically be possible via file copy
 // - - How to coordinate different drivers?
 
 // TODO support VOLUME_MOUNT_GROUP for SMB?
 // TODO support mapping from generic node_id to proper iqn/nqn in case volume publish is needed
-//      we could replace data in call just like we do with volume_id
+//      option: set node_id to node_name,iqn,nqn
+//              [+] no configuration required
+//              [-] node_id length limit can be exceeded with long iqn, nqn: 400+ > 256
+//      option: set node_id to node_name
+//              add config option maps: node_name -> iqn, node_name -> nqn
+//              replace node_id before calling ControllerPublishVolume, just like we do with volume_id field
+//              [-] this can be hard to maintain when nodes are added or reconfigured
 
 // volume_id format:   v2:server-entry/original-handle
 // snapshot_id format: v2:server-entry/original-handle
@@ -263,6 +277,24 @@ class CsiProxy2Driver extends CsiBaseDriver {
     return realDriver;
   }
 
+  async checkAndRun(driver, methodName, call, defaultValue) {
+    if(typeof driver[methodName] !== 'function') {
+      if (defaultValue) return defaultValue;
+      throw new GrpcError(
+        grpc.status.UNIMPLEMENTED,
+        `underlying driver does not support ` + methodName
+      );
+    }
+    return await driver[methodName](call);
+  }
+
+  async controllerRunWrapper(methodName, call, defaultValue) {
+    const volumeHandle = this.parseVolumeHandle(call.request.volume_id);
+    const driver = this.lookUpConnection(volumeHandle.connectionName);
+    call.request.volume_id = volumeHandle.realHandle;
+    return await this.checkAndRun(driver, methodName, call, defaultValue);
+  }
+
   // ===========================================
   //    Controller methods below
   // ===========================================
@@ -298,31 +330,29 @@ class CsiProxy2Driver extends CsiBaseDriver {
       default:
         throw 'unknown volume_content_source type: ' + call.request.volume_content_source.type;
     }
-    const result = await driver.CreateVolume(call);
+    const result = await this.checkAndRun(driver, 'CreateVolume', call);
     this.ctx.logger.debug("CreateVolume result " + result);
     result.volume.volume_id = this.decorateVolumeHandle(connectionName, result.volume.volume_id);
     return result;
   }
 
   async DeleteVolume(call) {
-    const volumeHandle = this.parseVolumeHandle(call.request.volume_id);
-    const driver = this.lookUpConnection(volumeHandle.connectionName);
-    call.request.volume_id = volumeHandle.realHandle;
-    return driver.DeleteVolume(call);
+    return await this.controllerRunWrapper('DeleteVolume', call);
+  }
+
+  async ControllerGetVolume(call) {
+    return await this.controllerRunWrapper('ControllerGetVolume', call);
   }
 
   async ControllerExpandVolume(call) {
-    const volumeHandle = this.parseVolumeHandle(call.request.volume_id);
-    const driver = this.lookUpConnection(volumeHandle.connectionName);
-    call.request.volume_id = volumeHandle.realHandle;
-    return driver.ControllerExpandVolume(call);
+    return await this.controllerRunWrapper('ControllerExpandVolume', call);
   }
 
   async CreateSnapshot(call) {
     const volumeHandle = this.parseVolumeHandle(call.request.source_volume_id);
     const driver = this.lookUpConnection(volumeHandle.connectionName);
     call.request.source_volume_id = volumeHandle.realHandle;
-    const result = await driver.CreateSnapshot(call);
+    const result = await this.checkAndRun(driver, 'CreateSnapshot', call);
     result.snapshot.source_volume_id = this.decorateVolumeHandle(connectionName, result.snapshot.source_volume_id);
     result.snapshot.snapshot_id = this.decorateVolumeHandle(connectionName, result.snapshot.snapshot_id);
     return result;
@@ -332,14 +362,11 @@ class CsiProxy2Driver extends CsiBaseDriver {
     const volumeHandle = this.parseVolumeHandle(call.request.snapshot_id);
     const driver = this.lookUpConnection(volumeHandle.connectionName);
     call.request.snapshot_id = volumeHandle.realHandle;
-    return driver.DeleteSnapshot(call);
+    return await this.checkAndRun(driver, 'DeleteSnapshot', call);
   }
 
   async ValidateVolumeCapabilities(call) {
-    const volumeHandle = this.parseVolumeHandle(call.request.volume_id);
-    const driver = this.lookUpConnection(volumeHandle.connectionName);
-    call.request.volume_id = volumeHandle.realHandle;
-    return driver.ValidateVolumeCapabilities(call);
+    return await this.controllerRunWrapper('ValidateVolumeCapabilities', call);
   }
 
   // ===========================================
@@ -369,7 +396,8 @@ class CsiProxy2Driver extends CsiBaseDriver {
   }
 
   async NodeStageVolume(call) {
-    return this.lookUpNodeDriver(call).NodeStageVolume(call);
+    const driver = this.lookUpNodeDriver(call);
+    return await this.checkAndRun(driver, 'NodeStageVolume', call);
   }
 }
 
