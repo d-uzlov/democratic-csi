@@ -879,7 +879,7 @@ class FreeNASApiDriver extends CsiBaseDriver {
               callContext.logger.verbose("FreeNAS ISCSI TARGET: %j", target);
 
               // set target.id on zvol
-              await zb.zfs.set(datasetName, {
+              await zb.zfs.set(callContext, datasetName, {
                 [FREENAS_ISCSI_TARGET_ID_PROPERTY_NAME]: target.id,
               });
 
