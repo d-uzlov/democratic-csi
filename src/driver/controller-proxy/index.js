@@ -20,6 +20,7 @@ class CsiProxyDriver extends CsiBaseDriver {
       this.options.proxy.configFolder = this.options.proxy.configFolder.slice(0, -1);
     }
     this.nodeIdSerializer = new NodeIdSerializer(ctx, options.proxy.nodeId || {});
+    this.driverCache = {};
 
     // corresponding storage class could be deleted without notice
     // let's delete entry from cache after 1 hour, so it can be cleaned by GC
@@ -123,6 +124,14 @@ class CsiProxyDriver extends CsiBaseDriver {
     }
   }
 
+  getCleanupHandlers() {
+    const result = [...this.cleanup];
+    for (const connectionName in this.driverCache) {
+      result.push(() => this.removeCacheEntry(connectionName));
+    }
+    return result;
+  }
+
   parseVolumeHandle(handle, prefix = volumeIdPrefix) {
     if (!handle.startsWith(prefix)) {
       throw new GrpcError(
@@ -152,12 +161,15 @@ class CsiProxyDriver extends CsiBaseDriver {
       return this.createDriverFromFile(configPath);
     }
 
-    const driverPlaceholder = {
-      connectionName: connectionName,
-      fileTime: 0,
-      driver: null,
-    };
-    const cachedDriver = this.ctx.registry.get(`controller:driver/connection=${connectionName}`, driverPlaceholder);
+    let cachedDriver = this.driverCache[connectionName];
+    if (!cachedDriver) {
+      cachedDriver = {
+        connectionName: connectionName,
+        fileTime: 0,
+        driver: null,
+      };
+      this.driverCache[connectionName] = cachedDriver;
+    }
     if (cachedDriver.timer !== null) {
       clearTimeout(cachedDriver.timer);
       cachedDriver.timer = null;
@@ -165,19 +177,54 @@ class CsiProxyDriver extends CsiBaseDriver {
     if (this.enableCacheTimeout) {
       cachedDriver.timer = setTimeout(() => {
         this.ctx.logger.info("removing inactive connection: %s", connectionName);
-        this.ctx.registry.delete(`controller:driver/connection=${connectionName}`);
-        cachedDriver.timer = null;
+        removeCache(cachedDriver.driver);
       }, this.timeout);
     }
 
     const fileTime = this.getFileTime(configPath);
     if (cachedDriver.fileTime != fileTime) {
       this.ctx.logger.debug("connection version is old: file time %d != %d", cachedDriver.fileTime, fileTime);
+      this.runDriverCleanup(cachedDriver.driver);
       cachedDriver.fileTime = fileTime;
-      this.ctx.logger.info("creating a new connection: %s", connectionName);
       cachedDriver.driver = this.createDriverFromFile(configPath);
     }
     return cachedDriver.driver;
+  }
+
+  removeCacheEntry(connectionName) {
+    const cacheEntry = this.driverCache[connectionName];
+    if (!cacheEntry) {
+      return;
+    }
+    this.ctx.logger.debug("removing %s from cache", connectionName);
+    delete this.driverCache[connectionName];
+    if (cacheEntry.timer) {
+      clearTimeout(cacheEntry.timer);
+      cacheEntry.timer = null;
+    }
+    const driver = cacheEntry.driver;
+    cachedDriver.fileTime = 0;
+    cacheEntry.driver = null;
+    this.runDriverCleanup(driver);
+  }
+
+  runDriverCleanup(driver) {
+    if (!driver) {
+      return;
+    }
+    if (typeof driver.getCleanupHandlers !== 'function') {
+      this.ctx.logger.debug("old driver does not support cleanup");
+      return;
+    }
+    const cleanup = driver.getCleanupHandlers();
+    if (cleanup.length == 0) {
+      this.ctx.logger.debug("old driver does not require any cleanup");
+      return;
+    }
+    this.ctx.logger.debug("running %d cleanup functions", cleanup.length);
+    for (const cleanupFunc of cleanup) {
+      cleanupFunc();
+    }
   }
 
   getFileTime(path) {
@@ -192,6 +239,7 @@ class CsiProxyDriver extends CsiBaseDriver {
   }
 
   createDriverFromFile(configPath) {
+    this.ctx.logger.info("creating new driver from file: %s", configPath);
     const fileOptions = this.createOptionsFromFile(configPath);
     const mergedOptions = structuredClone(this.options);
     _.merge(mergedOptions, fileOptions);
