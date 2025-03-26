@@ -125,9 +125,7 @@ There are 3 cases of cluster topology:
 - Each node has unique topology domain (`local` drivers)
 - All nodes are the same (usually the case for non-local drivers)
 - Several availability zones that can contain several nodes
-
-Simple cases are currently supported by the proxy.
-Custom availability zones are TBD.
+- - https://github.com/democratic-csi/democratic-csi/issues/459
 
 Example configuration:
 
@@ -137,8 +135,102 @@ proxy:
     # allowed values:
     # node - each node has its own storage
     # cluster - the whole cluster has unified storage
+    # custom - there are several custom zones with internal storage
     type: node
     # topology reported by CSI driver is reflected in k8s as node labels.
     # you may want to set unique prefixes on different drivers to avoid collisions
     prefix: org.democratic-csi.topology
 ```
+
+There are 2 components to this:
+1. Node driver must correctly report its availability zone
+2. Controller must set required zone labels in volume
+
+Since proxy driver should work with drivers from potentially different availability zones,
+it requires a config to distinguish zones.
+
+## Custom topology: node driver
+
+Driver reports node topology based on the list of rules in the config.
+
+If some rule does not match the input, the rule is ignored.
+So, if needed, you can use rules that are only valid on certain nodes.
+
+Config example:
+
+```yaml
+proxy:
+  nodeTopology:
+    type: custom
+    prefix: org.democratic-csi.topology
+    customRules:
+    # resulting topology looks like this:
+    # ${ prefix }/${ customRules[*].keySuffix } == ${ customRules[*].resultTemplate }
+    - keySuffix: zone
+      # possible sources:
+      # - nodeName
+      # - hostname
+      # - env
+      # - file
+      source: nodeName
+      # used only when "source: env"
+      envName: DEMOCRATIC_CSI_REGION
+      # used only when "source: file"
+      # file must be mounted into container filesystem manually
+      file: /mnt/topology/region
+      # match can:
+      # - be exact: "matchRegexp: my-node-1.domain"
+      # - use regex: "matchRegexp: .*.domain"
+      # - use capture groups: "matchRegexp: .*.(zone-.*).domain"
+      # Partial matches are not allowed: driver implicitly appends ^ and $ to regex.
+      matchRegexp: my-node-1.domain
+      # result template can:
+      # - be exact: zone-1
+      # - use values from capture groups: zone-${match:1}
+      # - - ${match:0} contains the whole input
+      # - - ${match:1} contains the first capture group, and so on
+      resultTemplate: zone1
+    - keySuffix: region
+      source: hostname
+      matchRegexp: .*-reg(.*)
+      resultTemplate: region${match:1}
+    - keySuffix: region
+      source: nodeName
+      # override zone for these 2 nodes
+      matchRegexp: n1|n2
+      resultTemplate: special-zone
+```
+
+Ideas for writing rules:
+
+- Encode zone name in the node name
+- Wait for k8s DownwardAPI for node labels
+- - Should be alpha in k8s v1.33: https://github.com/kubernetes/kubernetes/issues/40610
+- Inject node labels into environment variables via a webhook: https://kyverno.io/policies/other/mutate-pod-binding/mutate-pod-binding/
+- Deploy a separate node DaemonSet for each zone, with zone in an environment variable
+- Configure each node: place zone info into a file on host
+
+## Custom topology: controller driver
+
+The only thing needed from controller is to set topology requirements when volume is created.
+
+This can be done by adding topology requirements into connection config:
+
+```yaml
+# add to each _real_ driver config
+proxy:
+  perDriver:
+    topology:
+    # keys must correspond to proxy.nodeTopology.fromRegexp[*].topologyKey
+    # values must correspond to values reported by nodes
+    - requirements:
+        region: region1
+        zone: zone1
+      # you can add custom node affinity labels
+      # they will be added on top of node requirements
+      extra: {}
+```
+
+Proxy will set these constraints when volume is created, no other configuration is required.
+
+Different connections can have different topology.
