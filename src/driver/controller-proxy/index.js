@@ -6,10 +6,11 @@ const fs = require('fs');
 const { Registry } = require("../../utils/registry");
 const { GrpcError, grpc } = require("../../utils/grpc");
 const path = require('path');
+const os = require("os");
 
 const volumeIdPrefix = 'v:';
 const snapshotIdPrefix = 's:';
-const NODE_TOPOLOGY_KEY_NAME = "org.democratic-csi.topology/node";
+const TOPOLOGY_DEFAULT_PREFIX = 'org.democratic-csi.topology';
 
 class CsiProxyDriver extends CsiBaseDriver {
   constructor(ctx, options) {
@@ -18,6 +19,7 @@ class CsiProxyDriver extends CsiBaseDriver {
     if (this.options.proxy.configFolder.slice(-1) == '/') {
       this.options.proxy.configFolder = this.options.proxy.configFolder.slice(0, -1);
     }
+    this.nodeIdSerializer = new NodeIdSerializer(ctx, options.proxy.nodeId || {});
 
     // corresponding storage class could be deleted without notice
     // let's delete entry from cache after 1 hour, so it can be cleaned by GC
@@ -208,8 +210,7 @@ class CsiProxyDriver extends CsiBaseDriver {
 
   validateDriverType(driver) {
     const unsupportedDrivers = [
-      "zfs-local-",
-      "local-hostpath",
+      "zfs-local-ephemeral-inline",
       "objectivefs",
       "proxy",
     ];
@@ -239,7 +240,7 @@ class CsiProxyDriver extends CsiBaseDriver {
   }
 
   async checkAndRun(driver, methodName, call, defaultValue) {
-    if(typeof driver[methodName] !== 'function') {
+    if (typeof driver[methodName] !== 'function') {
       if (defaultValue) return defaultValue;
       // UNIMPLEMENTED could possibly confuse CSI CO into thinking
       // that driver does not support methodName at all.
@@ -322,7 +323,6 @@ class CsiProxyDriver extends CsiBaseDriver {
         );
     }
     const result = await this.checkAndRun(driver, 'CreateVolume', call);
-    this.ctx.logger.debug("CreateVolume result " + result);
     result.volume.volume_id = this.decorateVolumeHandle(connectionName, result.volume.volume_id);
     return result;
   }
@@ -387,16 +387,153 @@ class CsiProxyDriver extends CsiBaseDriver {
   }
 
   async NodeGetInfo(call) {
-    const nodeName = process.env.CSI_NODE_ID || os.hostname();
     const result = {
-      node_id: nodeName,
+      node_id: this.nodeIdSerializer.serialize(),
       max_volumes_per_node: 0,
     };
-    result.accessible_topology = {
-      segments: {
-        [NODE_TOPOLOGY_KEY_NAME]: nodeName,
-      },
-    };
+    const topologyType = this.options.proxy.nodeTopology?.type ?? 'cluster';
+    const prefix = this.options.proxy.nodeTopology?.prefix ?? TOPOLOGY_DEFAULT_PREFIX;
+    switch (topologyType) {
+      case 'cluster':
+        result.accessible_topology = {
+          segments: {
+            [prefix + '/cluster']: 'local',
+          },
+        };
+        break
+      case 'node':
+        result.accessible_topology = {
+          segments: {
+            [prefix + '/node']: NodeIdSerializer.getLocalNodeName(),
+          },
+        };
+        break
+      default:
+        throw new GrpcError(
+          grpc.status.INVALID_ARGUMENT,
+          `proxy: unknown node topology type: ${topologyType}`
+        );
+    }
+    return result;
+  }
+}
+
+const nodeIdCode_NodeName = 'n';
+const nodeIdCode_Hostname = 'h';
+const nodeIdCode_ISCSI = 'i';
+const nodeIdCode_NVMEOF = 'v';
+class NodeIdSerializer {
+  constructor(ctx, nodeIdConfig) {
+    this.ctx = ctx;
+    this.config = nodeIdConfig;
+  }
+
+  static getLocalNodeName() {
+    if (!process.env.CSI_NODE_ID) {
+      throw 'CSI_NODE_ID is required for proxy driver';
+    }
+    return process.env.CSI_NODE_ID;
+  }
+  static getLocalIqn() {
+    const iqnPath = '/etc/iscsi/initiatorname.iscsi';
+    const lines = fs.readFileSync(iqnPath, "utf8").split('\n');
+    for (let line of lines) {
+      line = line.replace(/#.*/, '').replace(/\s+$/, '');
+      if (line == '') {
+        continue;
+      }
+      const linePrefix = 'InitiatorName=';
+      if (line.startsWith(linePrefix)) {
+        const iqn = line.slice(linePrefix.length);
+        return iqn;
+      }
+    }
+    throw 'iqn is not found';
+  }
+  static getLocalNqn() {
+    const nqnPath = '/etc/nvme/hostnqn';
+    return fs.readFileSync(nqnPath, "utf8").replace(/\s+$/, '');
+  }
+
+  // returns { prefixName, suffix }
+  findPrefix(value, prefixMap) {
+    for (const prefixInfo of prefixMap) {
+      if (value.startsWith(prefixInfo.prefix)) {
+        return {
+          prefixName: prefixInfo.shortName,
+          suffix: value.split(prefixInfo.prefix.length),
+        };
+      }
+    }
+  }
+
+  serializeByPrefix(code, value, prefixMap) {
+    const prefixInfo = prefixMap.find(prefixInfo => value.startsWith(prefixInfo.prefix));
+    if (!prefixInfo) {
+      throw `node id: prefix is not found for value: ${value}`;
+    }
+    if (!prefixInfo.shortName.match(/^[0-9a-z]+$/)) {
+      throw `prefix short name must be alphanumeric, invalid name: '${prefixInfo.shortName}'`;
+    }
+    const suffix = value.substring(prefixInfo.prefix.length);
+    return code + prefixInfo.shortName + '=' + suffix;
+  }
+
+  deserializeFromPrefix(value, prefixMap, humanName) {
+    const prefixName = value.substring(0, value.indexOf('='));
+    const suffix = value.substring(value.indexOf('=') + 1);
+    const prefixInfo = prefixMap.find(prefixInfo => prefixInfo.shortName === prefixName);
+    if (!prefixInfo) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `unknown node prefix short name for ${humanName}: ${value}`
+      );
+    }
+    return prefixInfo.prefix + suffix;
+  }
+
+  // returns a single string that incorporates node id components specified in config.parts
+  serialize() {
+    let result = '';
+    if (this.config.parts?.nodeName ?? true) {
+      result += '/' + nodeIdCode_NodeName + '=' + NodeIdSerializer.getLocalNodeName();
+    }
+    if (this.config.parts?.hostname ?? false) {
+      result += '/' + nodeIdCode_Hostname + '=' + os.hostname();
+    }
+    if (this.config.parts?.iqn ?? false) {
+      result += '/' + this.serializeByPrefix(nodeIdCode_ISCSI, NodeIdSerializer.getLocalIqn(), this.config.iqnPrefix);
+    }
+    if (this.config.parts?.nqn ?? false) {
+      result += '/' + this.serializeByPrefix(nodeIdCode_NVMEOF, NodeIdSerializer.getLocalNqn(), this.config.nqnPrefix);
+    }
+    if (result === '') {
+      throw 'node id can not be empty';
+    }
+    // remove starting /
+    return result.slice(1);
+  }
+
+  // takes a string generated by NodeIdSerializer.serialize
+  // returns an { nodeName, iqn, nqn } if they exist in nodeId
+  deserialize(nodeId) {
+    const result = {};
+    for (const v in nodeId.split("/")) {
+      switch (v[0]) {
+        case nodeIdCode_NodeName:
+          result.nodeName = v.substring(v.indexOf('=') + 1);
+          continue;
+        case nodeIdCode_Hostname:
+          result.hostname = v.substring(v.indexOf('=') + 1);
+          continue;
+        case nodeIdCode_ISCSI:
+          result.iqn = this.deserializeFromPrefix(v, this.config.iqnPrefix, 'iSCSI');
+          continue;
+        case nodeIdCode_NVMEOF:
+          result.nqn = this.deserializeFromPrefix(v, this.config.nqnPrefix, 'NVMEoF');
+          continue;
+      }
+    }
     return result;
   }
 }
