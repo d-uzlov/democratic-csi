@@ -15,27 +15,23 @@ const TOPOLOGY_DEFAULT_PREFIX = 'org.democratic-csi.topology';
 class CsiProxyDriver extends CsiBaseDriver {
   constructor(ctx, options) {
     super(...arguments);
-    this.options.proxy.configFolder = path.normalize(this.options.proxy.configFolder);
-    if (this.options.proxy.configFolder.slice(-1) == '/') {
-      this.options.proxy.configFolder = this.options.proxy.configFolder.slice(0, -1);
-    }
+
+    this.initCapabilities();
+
     this.nodeIdSerializer = new NodeIdSerializer(ctx, options.proxy.nodeId || {});
-    this.driverCache = {};
 
-    // corresponding storage class could be deleted without notice
-    // let's delete entry from cache after 1 hour, so it can be cleaned by GC
-    // one hour seems long enough to avoid recreating frequently used drivers
-    // creating a new instance after long inactive period shouldn't be a problem
-    const oneMinuteInMs = 1000 * 60;
-    this.enableCacheTimeout = this.options.proxy.cacheTimeoutMinutes != -1;
-    this.cacheTimeout = (this.options.proxy.cacheTimeoutMinutes ?? 60) * oneMinuteInMs;
-    if (!this.enableCacheTimeout) {
-      this.ctx.logger.info("driver cache is permanent");
-    } else {
-      this.ctx.logger.info(`driver cache timeout is ${this.options.proxy.cacheTimeoutMinutes} minutes`);
+    let configFolder = path.normalize(this.options.proxy.configFolder);
+    if (configFolder.slice(-1) == '/') {
+      configFolder = configFolder.slice(0, -1);
     }
 
-    options = options || {};
+    const timeoutMinutes = this.options.proxy.cacheTimeoutMinutes ?? 60;
+    const defaultOptions = this.options;
+    this.driverCache = new DriverCache(ctx, configFolder, timeoutMinutes, defaultOptions);
+  }
+
+  initCapabilities() {
+    const options = this.options;
     options.service = options.service || {};
     options.service.identity = options.service.identity || {};
     options.service.controller = options.service.controller || {};
@@ -125,11 +121,9 @@ class CsiProxyDriver extends CsiBaseDriver {
   }
 
   getCleanupHandlers() {
-    const result = [...this.cleanup];
-    for (const connectionName in this.driverCache) {
-      result.push(() => this.removeCacheEntry(connectionName));
-    }
-    return result;
+    const cacheCleanup = this.driverCache.getCleanupHandlers();
+    // this.cleanup is not modified, concat returns a new object
+    return this.cleanup.concat(cacheCleanup);
   }
 
   parseVolumeHandle(handle, prefix = volumeIdPrefix) {
@@ -150,11 +144,220 @@ class CsiProxyDriver extends CsiBaseDriver {
     return prefix + connectionName + '/' + handle;
   }
 
+  async checkAndRun(driver, methodName, call, defaultValue) {
+    if (typeof driver[methodName] !== 'function') {
+      if (defaultValue) return defaultValue;
+      // UNIMPLEMENTED could possibly confuse CSI CO into thinking
+      // that driver does not support methodName at all.
+      // INVALID_ARGUMENT should allow CO to use methodName with other storage classes.
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `underlying driver does not support ` + methodName
+      );
+    }
+    return await driver[methodName](call);
+  }
+
+  async controllerRunWrapper(methodName, call, defaultValue) {
+    const volumeHandle = this.parseVolumeHandle(call.request.volume_id);
+    const driver = this.driverCache.lookUpConnection(volumeHandle.connectionName);
+    call.request.volume_id = volumeHandle.realHandle;
+    return await this.checkAndRun(driver, methodName, call, defaultValue);
+  }
+
+  // ===========================================
+  //    Controller methods below
+  // ===========================================
+
+  async GetCapacity(call) {
+    const parameters = call.request.parameters;
+    if (!parameters.connection) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `connection missing from parameters`
+      );
+    }
+    const connectionName = parameters.connection;
+    const driver = this.driverCache.lookUpConnection(connectionName);
+    return await this.checkAndRun(driver, 'GetCapacity', call, {
+      available_capacity: Number.MAX_SAFE_INTEGER,
+    });
+  }
+
+  async CreateVolume(call) {
+    const parameters = call.request.parameters;
+    if (!parameters.connection) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `connection missing from parameters`
+      );
+    }
+    const connectionName = parameters.connection;
+    const driver = this.driverCache.lookUpConnection(connectionName);
+
+    switch (call.request.volume_content_source?.type) {
+      case "snapshot": {
+        const snapshotHandle = this.parseVolumeHandle(call.request.volume_content_source.snapshot.snapshot_id, snapshotIdPrefix);
+        if (snapshotHandle.connectionName != connectionName) {
+          throw new GrpcError(
+            grpc.status.INVALID_ARGUMENT,
+            `can not inflate snapshot from a different connection`
+          );
+        }
+        call.request.volume_content_source.snapshot.snapshot_id = snapshotHandle.realHandle;
+        break;
+      }
+      case "volume": {
+        const volumeHandle = this.parseVolumeHandle(call.request.volume_content_source.volume.volume_id);
+        if (volumeHandle.connectionName != connectionName) {
+          throw new GrpcError(
+            grpc.status.INVALID_ARGUMENT,
+            `can not clone volume from a different connection`
+          );
+        }
+        call.request.volume_content_source.volume.volume_id = volumeHandle.realHandle;
+        break;
+      }
+      case undefined:
+      case null:
+        break;
+      default:
+        throw new GrpcError(
+          grpc.status.INVALID_ARGUMENT,
+          `unknown volume_content_source type: ${call.request.volume_content_source.type}`
+        );
+    }
+    const result = await this.checkAndRun(driver, 'CreateVolume', call);
+    result.volume.volume_id = this.decorateVolumeHandle(connectionName, result.volume.volume_id);
+    return result;
+  }
+
+  async DeleteVolume(call) {
+    return await this.controllerRunWrapper('DeleteVolume', call);
+  }
+
+  async ControllerGetVolume(call) {
+    return await this.controllerRunWrapper('ControllerGetVolume', call);
+  }
+
+  async ControllerExpandVolume(call) {
+    return await this.controllerRunWrapper('ControllerExpandVolume', call);
+  }
+
+  async CreateSnapshot(call) {
+    const volumeHandle = this.parseVolumeHandle(call.request.source_volume_id);
+    const driver = this.driverCache.lookUpConnection(volumeHandle.connectionName);
+    call.request.source_volume_id = volumeHandle.realHandle;
+    const result = await this.checkAndRun(driver, 'CreateSnapshot', call);
+    result.snapshot.source_volume_id = this.decorateVolumeHandle(connectionName, result.snapshot.source_volume_id);
+    result.snapshot.snapshot_id = this.decorateVolumeHandle(connectionName, result.snapshot.snapshot_id, snapshotIdPrefix);
+    return result;
+  }
+
+  async DeleteSnapshot(call) {
+    const volumeHandle = this.parseVolumeHandle(call.request.snapshot_id, snapshotIdPrefix);
+    const driver = this.driverCache.lookUpConnection(volumeHandle.connectionName);
+    call.request.snapshot_id = volumeHandle.realHandle;
+    return await this.checkAndRun(driver, 'DeleteSnapshot', call);
+  }
+
+  async ValidateVolumeCapabilities(call) {
+    return await this.controllerRunWrapper('ValidateVolumeCapabilities', call);
+  }
+
+  // ===========================================
+  //    Node methods below
+  // ===========================================
+  //
+  // Theoretically, controller setup with config files could be replicated in node deployment,
+  // and node could create proper drivers for each call.
+  // But it doesn't seem like node would benefit from this.
+  // - CsiBaseDriver.NodeStageVolume calls this.assertCapabilities which should be run in the real driver
+  //   but no driver-specific functions or options are used.
+  //   So we can just create an empty driver with default options
+  // - Other Node* methods don't use anything driver specific
+
+  lookUpNodeDriver(call) {
+    const driverType = call.request.volume_context.provisioner_driver;
+    // there is no cache timeout for node drivers
+    // because drivers are not updated dynamically
+    return this.ctx.registry.get(`node:driver/${driverType}`, () => {
+      const driverOptions = structuredClone(this.options);
+      driverOptions.driver = driverType;
+      return this.driverCache.createRealDriver(driverOptions);
+    });
+  }
+
+  async NodeStageVolume(call) {
+    const driver = this.lookUpNodeDriver(call);
+    return await this.checkAndRun(driver, 'NodeStageVolume', call);
+  }
+
+  async NodeGetInfo(call) {
+    const result = {
+      node_id: this.nodeIdSerializer.serialize(),
+      max_volumes_per_node: 0,
+    };
+    const topologyType = this.options.proxy.nodeTopology?.type ?? 'cluster';
+    const prefix = this.options.proxy.nodeTopology?.prefix ?? TOPOLOGY_DEFAULT_PREFIX;
+    switch (topologyType) {
+      case 'cluster':
+        result.accessible_topology = {
+          segments: {
+            [prefix + '/cluster']: 'local',
+          },
+        };
+        break
+      case 'node':
+        result.accessible_topology = {
+          segments: {
+            [prefix + '/node']: NodeIdSerializer.getLocalNodeName(),
+          },
+        };
+        break
+      default:
+        throw new GrpcError(
+          grpc.status.INVALID_ARGUMENT,
+          `proxy: unknown node topology type: ${topologyType}`
+        );
+    }
+    return result;
+  }
+}
+
+class DriverCache {
+  constructor(ctx, configFolder, timeoutMinutes, defaultOptions) {
+    this.driverCache = {};
+    this.ctx = ctx;
+    this.defaultOptions = defaultOptions;
+    this.configFolder = configFolder;
+
+    // Corresponding storage class could be deleted without notice.
+    // We can delete drivers that weren't requested for a long time.
+    // User can configure cache timeout so that driver re-creation is not too frequent.
+
+    this.enableCacheTimeout = timeoutMinutes != -1;
+    if (this.enableCacheTimeout) {
+      const oneMinuteInMs = 1000 * 60;
+      this.cacheTimeoutMs = timeoutMinutes * oneMinuteInMs;
+      this.ctx.logger.info(`driver cache timeout is ${timeoutMinutes} minutes`);
+    } else {
+      this.ctx.logger.info("driver cache is permanent");
+    }
+  }
+
+  getCleanupHandlers() {
+    const result = [];
+    for (const connectionName in this.driverCache) {
+      result.push(() => this.removeCacheEntry(connectionName));
+    }
+    return result;
+  }
+
   // returns real driver object
   // internally drivers are cached and deleted on timeout
   lookUpConnection(connectionName) {
-    const configFolder = this.options.proxy.configFolder;
-    const configPath = configFolder + '/' + connectionName + '.yaml';
+    const configPath = this.configFolder + '/' + connectionName + '.yaml';
 
     if (this.timeout == 0) {
       // when timeout is 0, force creating a new driver on each request
@@ -177,7 +380,7 @@ class CsiProxyDriver extends CsiBaseDriver {
     if (this.enableCacheTimeout) {
       cachedDriver.timer = setTimeout(() => {
         this.ctx.logger.info("removing inactive connection: %s", connectionName);
-        removeCache(cachedDriver.driver);
+        this.removeCacheEntry(cachedDriver.driver);
       }, this.timeout);
     }
 
@@ -241,7 +444,7 @@ class CsiProxyDriver extends CsiBaseDriver {
   createDriverFromFile(configPath) {
     this.ctx.logger.info("creating new driver from file: %s", configPath);
     const fileOptions = this.createOptionsFromFile(configPath);
-    const mergedOptions = structuredClone(this.options);
+    const mergedOptions = structuredClone(this.defaultOptions);
     _.merge(mergedOptions, fileOptions);
     return this.createRealDriver(mergedOptions);
   }
@@ -253,22 +456,6 @@ class CsiProxyDriver extends CsiBaseDriver {
     } catch (e) {
       this.ctx.logger.error("failed parsing config file: %s", e.toString());
       throw e;
-    }
-  }
-
-  validateDriverType(driver) {
-    const unsupportedDrivers = [
-      "zfs-local-ephemeral-inline",
-      "objectivefs",
-      "proxy",
-    ];
-    for (const prefix in unsupportedDrivers) {
-      if (driver.startsWith(prefix)) {
-        throw new GrpcError(
-          grpc.status.INVALID_ARGUMENT,
-          `proxy is not supported for driver: ${mergedOptions.driver}`
-        );
-      }
     }
   }
 
@@ -287,182 +474,20 @@ class CsiProxyDriver extends CsiBaseDriver {
     return realDriver;
   }
 
-  async checkAndRun(driver, methodName, call, defaultValue) {
-    if (typeof driver[methodName] !== 'function') {
-      if (defaultValue) return defaultValue;
-      // UNIMPLEMENTED could possibly confuse CSI CO into thinking
-      // that driver does not support methodName at all.
-      // INVALID_ARGUMENT should allow CO to use methodName with other storage classes.
-      throw new GrpcError(
-        grpc.status.INVALID_ARGUMENT,
-        `underlying driver does not support ` + methodName
-      );
-    }
-    return await driver[methodName](call);
-  }
-
-  async controllerRunWrapper(methodName, call, defaultValue) {
-    const volumeHandle = this.parseVolumeHandle(call.request.volume_id);
-    const driver = this.lookUpConnection(volumeHandle.connectionName);
-    call.request.volume_id = volumeHandle.realHandle;
-    return await this.checkAndRun(driver, methodName, call, defaultValue);
-  }
-
-  // ===========================================
-  //    Controller methods below
-  // ===========================================
-
-  async GetCapacity(call) {
-    const parameters = call.request.parameters;
-    if (!parameters.connection) {
-      throw new GrpcError(
-        grpc.status.INVALID_ARGUMENT,
-        `connection missing from parameters`
-      );
-    }
-    const connectionName = parameters.connection;
-    const driver = this.lookUpConnection(connectionName);
-    return await this.checkAndRun(driver, 'GetCapacity', call, {
-      available_capacity: Number.MAX_SAFE_INTEGER,
-    });
-  }
-
-  async CreateVolume(call) {
-    const parameters = call.request.parameters;
-    if (!parameters.connection) {
-      throw new GrpcError(
-        grpc.status.INVALID_ARGUMENT,
-        `connection missing from parameters`
-      );
-    }
-    const connectionName = parameters.connection;
-    const driver = this.lookUpConnection(connectionName);
-
-    switch (call.request.volume_content_source?.type) {
-      case "snapshot": {
-        const snapshotHandle = this.parseVolumeHandle(call.request.volume_content_source.snapshot.snapshot_id, snapshotIdPrefix);
-        if (snapshotHandle.connectionName != connectionName) {
-          throw new GrpcError(
-            grpc.status.INVALID_ARGUMENT,
-            `can not inflate snapshot from a different connection`
-          );
-        }
-        call.request.volume_content_source.snapshot.snapshot_id = snapshotHandle.realHandle;
-        break;
-      }
-      case "volume": {
-        const volumeHandle = this.parseVolumeHandle(call.request.volume_content_source.volume.volume_id);
-        if (volumeHandle.connectionName != connectionName) {
-          throw new GrpcError(
-            grpc.status.INVALID_ARGUMENT,
-            `can not clone volume from a different connection`
-          );
-        }
-        call.request.volume_content_source.volume.volume_id = volumeHandle.realHandle;
-        break;
-      }
-      case undefined:
-      case null:
-        break;
-      default:
+  validateDriverType(driver) {
+    const unsupportedDrivers = [
+      "zfs-local-ephemeral-inline",
+      "objectivefs",
+      "proxy",
+    ];
+    for (const prefix in unsupportedDrivers) {
+      if (driver.startsWith(prefix)) {
         throw new GrpcError(
           grpc.status.INVALID_ARGUMENT,
-          `unknown volume_content_source type: ${call.request.volume_content_source.type}`
+          `proxy is not supported for driver: ${mergedOptions.driver}`
         );
+      }
     }
-    const result = await this.checkAndRun(driver, 'CreateVolume', call);
-    result.volume.volume_id = this.decorateVolumeHandle(connectionName, result.volume.volume_id);
-    return result;
-  }
-
-  async DeleteVolume(call) {
-    return await this.controllerRunWrapper('DeleteVolume', call);
-  }
-
-  async ControllerGetVolume(call) {
-    return await this.controllerRunWrapper('ControllerGetVolume', call);
-  }
-
-  async ControllerExpandVolume(call) {
-    return await this.controllerRunWrapper('ControllerExpandVolume', call);
-  }
-
-  async CreateSnapshot(call) {
-    const volumeHandle = this.parseVolumeHandle(call.request.source_volume_id);
-    const driver = this.lookUpConnection(volumeHandle.connectionName);
-    call.request.source_volume_id = volumeHandle.realHandle;
-    const result = await this.checkAndRun(driver, 'CreateSnapshot', call);
-    result.snapshot.source_volume_id = this.decorateVolumeHandle(connectionName, result.snapshot.source_volume_id);
-    result.snapshot.snapshot_id = this.decorateVolumeHandle(connectionName, result.snapshot.snapshot_id, snapshotIdPrefix);
-    return result;
-  }
-
-  async DeleteSnapshot(call) {
-    const volumeHandle = this.parseVolumeHandle(call.request.snapshot_id, snapshotIdPrefix);
-    const driver = this.lookUpConnection(volumeHandle.connectionName);
-    call.request.snapshot_id = volumeHandle.realHandle;
-    return await this.checkAndRun(driver, 'DeleteSnapshot', call);
-  }
-
-  async ValidateVolumeCapabilities(call) {
-    return await this.controllerRunWrapper('ValidateVolumeCapabilities', call);
-  }
-
-  // ===========================================
-  //    Node methods below
-  // ===========================================
-  //
-  // Theoretically, controller setup with config files could be replicated in node deployment,
-  // and node could create proper drivers for each call.
-  // But it doesn't seem like node would benefit from this.
-  // - CsiBaseDriver.NodeStageVolume calls this.assertCapabilities which should be run in the real driver
-  //   but no driver-specific functions or options are used.
-  //   So we can just create an empty driver with default options
-  // - Other Node* methods don't use anything driver specific
-
-  lookUpNodeDriver(call) {
-    const driverType = call.request.volume_context.provisioner_driver;
-    return this.ctx.registry.get(`node:driver/${driverType}`, () => {
-      const driverOptions = structuredClone(this.options);
-      driverOptions.driver = driverType;
-      return this.createRealDriver(driverOptions);
-    });
-  }
-
-  async NodeStageVolume(call) {
-    const driver = this.lookUpNodeDriver(call);
-    return await this.checkAndRun(driver, 'NodeStageVolume', call);
-  }
-
-  async NodeGetInfo(call) {
-    const result = {
-      node_id: this.nodeIdSerializer.serialize(),
-      max_volumes_per_node: 0,
-    };
-    const topologyType = this.options.proxy.nodeTopology?.type ?? 'cluster';
-    const prefix = this.options.proxy.nodeTopology?.prefix ?? TOPOLOGY_DEFAULT_PREFIX;
-    switch (topologyType) {
-      case 'cluster':
-        result.accessible_topology = {
-          segments: {
-            [prefix + '/cluster']: 'local',
-          },
-        };
-        break
-      case 'node':
-        result.accessible_topology = {
-          segments: {
-            [prefix + '/node']: NodeIdSerializer.getLocalNodeName(),
-          },
-        };
-        break
-      default:
-        throw new GrpcError(
-          grpc.status.INVALID_ARGUMENT,
-          `proxy: unknown node topology type: ${topologyType}`
-        );
-    }
-    return result;
   }
 }
 
