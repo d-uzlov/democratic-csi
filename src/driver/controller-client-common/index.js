@@ -112,21 +112,6 @@ class ControllerClientCommonDriver extends CsiBaseDriver {
         //options.service.node.capabilities.rpc.push("VOLUME_MOUNT_GROUP");
       }
     }
-
-    if (this.ctx.args.csiMode.includes("controller")) {
-      setInterval(() => {
-        this.ctx.logger.info("snapshots cut in flight", {
-          names: [...SNAPSHOTS_CUT_IN_FLIGHT],
-          count: SNAPSHOTS_CUT_IN_FLIGHT.size,
-        });
-      }, 30 * 1000);
-      setInterval(() => {
-        this.ctx.logger.info("snapshots restore in flight", {
-          names: [...SNAPSHOTS_RESTORE_IN_FLIGHT],
-          count: SNAPSHOTS_RESTORE_IN_FLIGHT.size,
-        });
-      }, 30 * 1000);
-    }
   }
 
   getAccessModes(capability) {
